@@ -1,10 +1,22 @@
-use futures::stream::StreamExt;
-use std::{ffi::CStr, ptr};
-use std::os::raw::c_char;
-use tracing::Level;
-use tracing_subscriber::FmtSubscriber;
-use redbpf::load::Loader;
-use probes::openmonitor::OpenPath;
+
+pub const PATHLEN: usize = 256;
+
+#[repr(C, packed(1))]
+pub struct TracepointCommonArgs {
+    pub ctype: u16,
+    pub flags: u8,
+    pub preempt_count: u8,
+    pub pid: i32,
+}
+#[repr(C, packed(1))]
+pub struct ExecveStruct {
+    pub common        : TracepointCommonArgs,
+    pub __syscall_nr  : i32,
+    pub pad           : u32,
+    pub filename_addr : u64,
+    pub args_addr     : u64,
+    pub envp_addr     : u64,
+}
 fn probe_code() -> &'static [u8] {
     include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -12,51 +24,30 @@ fn probe_code() -> &'static [u8] {
     ))
 }
 
+use libc;
+use std::process;
+use tokio::signal::ctrl_c;
+use tracing::{error, subscriber, Level};
+use tracing_subscriber::FmtSubscriber;
+use redbpf::load::Loader;
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-
     let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::WARN)
+        .with_max_level(Level::TRACE)
         .finish();
-    tracing::subscriber::set_global_default(subscriber).unwrap();
-
-    let mut loaded = Loader::load(probe_code()).expect("error on Loader::load");
-    /*
-    let probe = loaded
-        .kprobe_mut("do_sys_open")
-        .expect("error on Loaded::kprobe_mut");
-    probe
-        .attach_kprobe("do_sys_open", 0)
-        .expect("error on KProbe::attach_kprobe");
-    probe
-        .attach_kprobe("do_sys_openat2", 0)
-        .expect("error on KProbe::attach_kprobe");
-    */
-    let probe2 = loaded.kprobe_mut("syscall__execve").expect("error on Loaded::kprobe_mut");
-    //probe2.attach_kprobe("sys_enter_exec",0).expect("error on KProbe::attach_kprobe");
-    probe2.attach_kprobe("__x64_sys_execve",0).expect("error on KProbe::attach_kprobe");
-    while let Some((map_name, events)) = loaded.events.next().await {
-        if map_name == "PROCESS_PATHS" {
-            for event in events {
-                let exec_path = unsafe { event.as_ptr() as *mut [c_char;16]};
-                let rust_id = unsafe { CStr::from_ptr((*exec_path).as_ptr()) };
-                let rust_id = rust_id.to_owned();
-                unsafe {
-                    println!("process {:?}",rust_id);
-                };
-            }
-        }
+    subscriber::set_global_default(subscriber).unwrap();
+    if unsafe { libc::geteuid() != 0 } {
+        error!("You must be root to use eBPF!");
+        process::exit(1);
     }
-    /*
-    while let Some((map_name, events)) = loaded.events.next().await {
-        if map_name == "OPEN_PATHS" {
-            for event in events {
-                let open_path = unsafe { ptr::read(event.as_ptr() as *const OpenPath) };
-                unsafe {
-                    let cfilename = CStr::from_ptr(open_path.filename.as_ptr() as *const _);
-                    println!("{}", cfilename.to_string_lossy());
-                };
-            }
-        }
-    }*/
+
+    let mut loaded = Loader::load(probe_code()).expect("error loading probe");
+    for tracepoint in loaded.tracepoints_mut() {
+        tracepoint.attach_trace_point("syscalls", "sys_enter_execve")
+            .expect(format!("error on attach_trace_point to {}", tracepoint.name()).as_str());
+    }
+
+    println!("Hit Ctrl-C to quit");
+    ctrl_c().await.expect("Error awaiting CTRL-C");
 }
